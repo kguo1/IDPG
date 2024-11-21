@@ -1,0 +1,9 @@
+*.slurm
+*.err
+*.out
+*.save
+main_results/
+home/
+scratch/
+roberta.large.tar.gz
+*.pyc
