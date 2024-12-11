@@ -49,11 +49,10 @@ Model | Description | # params | Download
 ## Train and evaluate IDPG Fractional prompt insertion
 We provide example training scripts for fractional prompt insertion. 
 
-submitp9.slurm, submitp8.slurm, submitp7.slurm etc are training scripts for fractional prompt insertion. 
 
 
 ### Example usage
-Take submitp9.slurm as an example. To run it, you need to download checkpoints. Next, modify the `SAVE` and `NEWSAVE` variable, where `SAVE` is the path to your checkpoint folder, `NEWSAVE` is the path where you hope to store the intermediate checkpoints (i.e., fine-tuned checkpoints). 
+Take The example below as an example. To run it, you need to download checkpoints. Next, modify the `SAVE` and `NEWSAVE` variable, where `SAVE` is the path to your checkpoint folder, `NEWSAVE` is the path where you hope to store the intermediate checkpoints (i.e., fine-tuned checkpoints). 
 
 We explain the main arguments in following:
 * `insertionpositions`: The prompt insertion mode. modes 0 through four correspond to the prompt insertion positions from the original IDPG paper. mode 5 corresponds to fractional prompt insertion. 
@@ -193,11 +192,10 @@ date
 ## Train and evaluate IDPG multi position prompt insertion
 We provide example training scripts for multi position prompt insertion. 
 
-submitprtebase.slurm, submitcrbase.slurm,  etc are training scripts for multi position prompt insertion. 
 
 
 ### Example usage
-Take submitcrbase.slurm as an example. To run it, you need to download checkpoints. Next, modify the `SAVE` and `NEWSAVE` variable, where `SAVE` is the path to your checkpoint folder, `NEWSAVE` is the path where you hope to store the intermediate checkpoints (i.e., fine-tuned checkpoints). 
+Take The example below as an example. To run it, you need to download checkpoints. Next, modify the `SAVE` and `NEWSAVE` variable, where `SAVE` is the path to your checkpoint folder, `NEWSAVE` is the path where you hope to store the intermediate checkpoints (i.e., fine-tuned checkpoints). 
 
 We explain the main arguments in following:
 * `insertionpositions`: The prompt insertion mode. modes 0 through four correspond to the prompt insertion positions from the original IDPG paper. mode 6 corresponds to multi position prompt insertion. 
