@@ -7,17 +7,25 @@ MAX_SENTENCES=16        	# Batch size.
 ROBERTA_PATH=$1
 SAVE=$2
 seed=$3
-ARCH=roberta_large
+ARCH=roberta_base
 pdim=$4
 node=$5
 prefixlen=$6
 insertposition=$7
 LR=$8
 gq=16
+custom_insert_position_fraction=${10}
+distributed_world_size=${11}
+MAX_SENTENCES=${12}
+MAX_TOKENS=${13}
+ENCODER_EMBED_DIM=${14}
+FFN_DIM=${15}
+layers=${16}
 echo $ROBERTA_PATH
 echo $SAVE
 echo $seed
 echo $ARCH
+echo $layers
 
 mkdir -p ${SAVE}
 
@@ -27,14 +35,22 @@ CUDA_VISIBLE_DEVICES=$node fairseq-train cr-bin/ \
     --restore-file $ROBERTA_PATH \
     --max-positions 512 \
     --max-sentences $MAX_SENTENCES \
-    --max-tokens 4400 \
+    --max-tokens $MAX_TOKENS \
     --task sentence_prediction \
+    --memory-efficient-fp16 \
+    --encoder-embed-dim $ENCODER_EMBED_DIM \
+    --encoder-ffn-embed-dim $FFN_DIM \
+    --encoder-layers $layers \
+    --empty-cache-freq 100 \
+    --update-freq 4 \
     --reset-optimizer --reset-dataloader --reset-meters \
     --required-batch-size-multiple 1 \
     --init-token 0 --separator-token 2 \
     --arch $ARCH \
     --criterion sentence_prediction \
     --freeze-encoder \
+    --distributed-world-size $distributed_world_size \
+    --custom_insert_position_fraction $custom_insert_position_fraction \
     --add-suffix --suffix-len $prefixlen --prompt-generation --generation-freeze --insert-position $insertposition --generation-layer 2 --generation-quaternions $gq --middle-prompt-insert-layer 1 --middle-previous --middle-prompt-mode layerb --phm-bottleneck-dim $pdim \
     --num-classes $NUM_CLASSES \
     --dropout 0.1 --attention-dropout 0.1 \

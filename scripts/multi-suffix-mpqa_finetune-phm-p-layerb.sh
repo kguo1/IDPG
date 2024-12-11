@@ -15,8 +15,10 @@ insertposition=$7
 LR=$8
 gq=16
 mode=$9
+custom_insert_position_fraction=$10
 echo $ROBERTA_PATH
 echo $SAVE
+echo $custom_insert_position_fraction
 
 mkdir -p ${SAVE}
 
@@ -35,6 +37,7 @@ CUDA_VISIBLE_DEVICES=$node fairseq-train mpqa-bin/ \
     --arch $ARCH \
     --criterion sentence_prediction \
     --freeze-encoder \
+    --custom_insert_position_fraction $custom_insert_position_fraction \
     --add-suffix --suffix-len $prefixlen --prompt-generation --generation-freeze --insert-position $insertposition --generation-layer 2 --generation-quaternions $gq --middle-prompt-insert-layer 1 --middle-previous --middle-prompt-mode layerb --phm-bottleneck-dim $pdim --prompt-insert-mode $mode \
     --num-classes $NUM_CLASSES \
     --dropout 0.1 --attention-dropout 0.1 \

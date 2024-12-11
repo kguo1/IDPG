@@ -66,8 +66,10 @@ for file in os.listdir(tasks_dir):
         and not file.startswith('.')
         and (file.endswith('.py') or os.path.isdir(path))
     ):
+        # get the task name
         task_name = file[:file.find('.py')] if file.endswith('.py') else file
         importlib.import_module('fairseq.tasks.' + task_name)
+        # import the task file which registers the task
 
         # expose `task_parser` for sphinx
         if task_name in TASK_REGISTRY:

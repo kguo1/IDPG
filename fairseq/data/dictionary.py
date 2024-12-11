@@ -31,10 +31,13 @@ class Dictionary(object):
         self.symbols = []
         self.count = []
         self.indices = {}
+        # add these symbols
         self.bos_index = self.add_symbol(bos)
         self.pad_index = self.add_symbol(pad)
         self.eos_index = self.add_symbol(eos)
         self.unk_index = self.add_symbol(unk)
+
+        # for sentence prediction this is false
         if extra_special_symbols:
             for s in extra_special_symbols:
                 self.add_symbol(s)
@@ -210,6 +213,7 @@ class Dictionary(object):
         ...
         ```
         """
+        # initialize class
         d = cls()
         d.add_from_file(f)
         return d

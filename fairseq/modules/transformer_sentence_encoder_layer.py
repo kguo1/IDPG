@@ -16,6 +16,9 @@ from fairseq.modules import (
 from fairseq.modules.quant_noise import quant_noise
 
 
+def kron(A, B):
+    return torch.einsum('ij,kl->ikjl', A, B).reshape(A.shape[0]*B.shape[0], A.shape[1]*B.shape[1])
+
 class TransformerSentenceEncoderLayer(nn.Module):
     """
     Implements a Transformer Encoder Layer used in BERT/XLM style pre-trained
@@ -134,8 +137,16 @@ class TransformerSentenceEncoderLayer(nn.Module):
         LayerNorm is applied either before or after the self-attention/ffn
         modules similar to the original Transformer implementation.
         """
+
+
+        # x has shape T x B x C
+        # suffix has shape suffix_len x B x C
+
+
         residual = x
         if suffix_x != None:
+
+            # shape (T + suffix_len // 2) x B x C
             key_x = torch.cat((x[:1][:], suffix_x[:suffix_x.size()[0] // 2][:], x[1:][:]), 0)
             value_x = torch.cat((x[:1][:], suffix_x[suffix_x.size()[0] // 2:][:], x[1:][:]), 0)
             if self_attn_padding_mask is not None:
@@ -186,7 +197,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
             tmp_x = compacter_down_proj_b2.repeat(x.size()[1], x.size()[0], 1).type_as(x)
             # 16 x len x 16
             for i in range(compacter_n):
-                w = torch.kron(compacter_shared_A2[i], torch.mm(compacter_down_proj_s2[i], compacter_down_proj_t2[i]))
+                w = kron(compacter_shared_A2[i], torch.mm(compacter_down_proj_s2[i], compacter_down_proj_t2[i]))
                 wx = torch.mm(xt, w).view(x.size()[1], -1, w.size()[1])
                 tmp_x += wx
             tmp_x = self.compacter_activation_fn(tmp_x)
@@ -197,7 +208,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = compacter_up_proj_b2.view(-1).repeat(residual_adapter.size()[1], residual_adapter.size()[0], 1).type_as(tmp_x).reshape(-1, residual_adapter.size()[2])
             # 16len x 1024
             for i in range(compacter_n):
-                w = torch.kron(compacter_shared_A2[i], torch.mm(compacter_up_proj_s2[i], compacter_up_proj_t2[i]))
+                w = kron(compacter_shared_A2[i], torch.mm(compacter_up_proj_s2[i], compacter_up_proj_t2[i]))
                 # 16 x 1024
                 x += torch.mm(tmp_x, w).type_as(tmp_x)
 
@@ -209,6 +220,8 @@ class TransformerSentenceEncoderLayer(nn.Module):
             # len x 16 x 1024
             x = residual_adapter + x
 
+
+        # shape T x B x d
         x = residual + x
         x = self.self_attn_layer_norm(x)
 
@@ -235,7 +248,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
             tmp_x = compacter_down_proj_b.repeat(x.size()[1], x.size()[0], 1).type_as(x)
             # 16 x len x 16
             for i in range(compacter_n):
-                w = torch.kron(compacter_shared_A[i], torch.mm(compacter_down_proj_s[i], compacter_down_proj_t[i]))
+                w = kron(compacter_shared_A[i], torch.mm(compacter_down_proj_s[i], compacter_down_proj_t[i]))
                 wx = torch.mm(xt, w).view(x.size()[1], -1, w.size()[1])
                 tmp_x += wx
             tmp_x = self.compacter_activation_fn(tmp_x)
@@ -246,7 +259,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
             x = compacter_up_proj_b.view(-1).repeat(residual_adapter.size()[1], residual_adapter.size()[0], 1).type_as(tmp_x).reshape(-1, residual_adapter.size()[2])
             # 16len x 1024
             for i in range(compacter_n):
-                w = torch.kron(compacter_shared_A[i], torch.mm(compacter_up_proj_s[i], compacter_up_proj_t[i]))
+                w = kron(compacter_shared_A[i], torch.mm(compacter_up_proj_s[i], compacter_up_proj_t[i]))
                 # 16 x 1024
                 x += torch.mm(tmp_x, w).type_as(tmp_x)
             x = x.view(residual_adapter.size()[1], -1, residual_adapter.size()[2])

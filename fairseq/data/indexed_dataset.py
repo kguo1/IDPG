@@ -26,9 +26,9 @@ def get_available_dataset_impl():
 
 
 def infer_dataset_impl(path):
-    if IndexedRawTextDataset.exists(path):
+    if IndexedRawTextDataset.exists(path):  # believe this should return false
         return 'raw'
-    elif IndexedDataset.exists(path):
+    elif IndexedDataset.exists(path): # evals to True
         with open(index_file_path(path), 'rb') as f:
             magic = f.read(8)
             if magic == IndexedDataset._HDR_MAGIC:

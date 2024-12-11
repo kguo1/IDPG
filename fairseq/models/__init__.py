@@ -45,6 +45,9 @@ __all__ = [
 
 
 def build_model(args, task):
+    print('Build model function')
+    print(ARCH_MODEL_REGISTRY, "arch model registry")
+    print(ARCH_MODEL_REGISTRY[args.arch])
     return ARCH_MODEL_REGISTRY[args.arch].build_model(args, task)
 
 
@@ -128,10 +131,13 @@ for file in os.listdir(models_dir):
         and not file.startswith('.')
         and (file.endswith('.py') or os.path.isdir(path))
     ):
+        
+        # imports model and registers it
         model_name = file[:file.find('.py')] if file.endswith('.py') else file
         module = importlib.import_module('fairseq.models.' + model_name)
 
         # extra `model_parser` for sphinx
+        # adds some more arguments
         if model_name in MODEL_REGISTRY:
             parser = argparse.ArgumentParser(add_help=False)
             group_archs = parser.add_argument_group('Named architectures')

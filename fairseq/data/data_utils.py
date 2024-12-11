@@ -70,11 +70,11 @@ def load_indexed_dataset(path, dictionary, dataset_impl=None, combine=False, def
     import fairseq.data.indexed_dataset as indexed_dataset
 
     datasets = []
-    for k in itertools.count():
+    for k in itertools.count(): # infinite loop
         path_k = path + (str(k) if k > 0 else '')
 
         dataset_impl_k = dataset_impl
-        if dataset_impl_k is None:
+        if dataset_impl_k is None: # we enter here
             dataset_impl_k = indexed_dataset.infer_dataset_impl(path_k)
 
         dataset = indexed_dataset.make_dataset(

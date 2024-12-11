@@ -76,6 +76,8 @@ class SentencePredictionTask(FairseqTask):
             )
         else:
             self._max_positions = args.max_positions
+
+        # currently 512
         args.tokens_per_sample = self._max_positions
 
     @classmethod
@@ -85,6 +87,9 @@ class SentencePredictionTask(FairseqTask):
         Args:
             filename (str): the filename
         """
+
+        # adds all of the symbols from the given dictionary
+        # dictionary is the symbol and then the count in the dataset
         dictionary = Dictionary.load(filename)
         dictionary.add_symbol('<mask>')
         return dictionary
@@ -121,15 +126,17 @@ class SentencePredictionTask(FairseqTask):
 
         def make_dataset(type, dictionary):
             split_path = get_path(type, split)
+            # data/input0 or input1/valid
 
             dataset = data_utils.load_indexed_dataset(
                 split_path,
                 dictionary,
-                self.args.dataset_impl,
-                combine=combine,
+                self.args.dataset_impl, # None
+                combine=combine, # False
             )
             return dataset
 
+        # source dictionary is the data dictionary
         input0 = make_dataset('input0', self.source_dictionary)
         assert input0 is not None, 'could not find dataset: {}'.format(get_path(type, split))
         input1 = make_dataset('input1', self.source_dictionary)
@@ -148,7 +155,7 @@ class SentencePredictionTask(FairseqTask):
         with data_utils.numpy_seed(self.args.seed):
             shuffle = np.random.permutation(len(src_tokens))
 
-        src_tokens = maybe_shorten_dataset(
+        src_tokens = maybe_shorten_dataset( # we dont shorten dataset
             src_tokens,
             split,
             self.args.shorten_data_split_list,
@@ -170,7 +177,7 @@ class SentencePredictionTask(FairseqTask):
             'ntokens': NumelDataset(src_tokens, reduce=True),
         }
 
-        if self.args.add_prev_output_tokens:
+        if self.args.add_prev_output_tokens: # False
             prev_tokens_dataset = RightPadDataset(
                 RollDataset(src_tokens, 1),
                 pad_idx=self.dictionary.pad(),
@@ -220,6 +227,11 @@ class SentencePredictionTask(FairseqTask):
             )
 
         logger.info("Loaded {0} with #samples: {1}".format(split, len(dataset)))
+
+        # for ix, data_point in enumerate(dataset):
+        #     print("data point:  ", data_point)
+        #     if ix == 3:
+        #         break
 
         self.datasets[split] = dataset
         return self.datasets[split]
