@@ -26,6 +26,10 @@ from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 import random
 
 
+
+def kron(A, B):
+    return torch.einsum('ij,kl->ikjl', A, B).reshape(A.shape[0]*B.shape[0], A.shape[1]*B.shape[1])
+
 def init_bert_params(module):
     """
     Initialize the weights specific to the BERT Model.
@@ -153,8 +157,14 @@ class TransformerSentenceEncoder(nn.Module):
         phm_bottleneck_dim: int = 16,
         prompt_insert_mode: int = 1, 
         glove_path: str = None,
+        custom_insert_position_fraction: float = 0,
+        original_max_positions: int = 256,
+        args = None,
         #prefix_prompt: torch.Tensor = torch.tensor([713, 16, 10, 205, 1569]),
     ) -> None:
+
+
+
 
         super().__init__()
         self.dictionary = dictionary
@@ -177,6 +187,10 @@ class TransformerSentenceEncoder(nn.Module):
         self.reparameterization = reparameterization
         self.phm_bottleneck_dim = phm_bottleneck_dim
         self.prompt_insert_mode = prompt_insert_mode
+        self.custom_insert_position_fraction = custom_insert_position_fraction
+        self.original_max_positions = original_max_positions
+        self.args = args
+
 
         if reparameterization != 'None': 
             self.re_lstm_head = torch.nn.LSTM(input_size=self.embedding_dim,
@@ -209,6 +223,10 @@ class TransformerSentenceEncoder(nn.Module):
             if self.num_segments > 0
             else None
         )
+
+
+        print("max sequence length", max_seq_len)
+        print(original_max_positions, 'original max positions')
 
         self.embed_positions = (
             PositionalEmbedding(
@@ -258,7 +276,9 @@ class TransformerSentenceEncoder(nn.Module):
         if freeze_embeddings:
             freeze_module_params(self.embed_tokens)
             freeze_module_params(self.segment_embeddings)
-            freeze_module_params(self.embed_positions)
+            # actually probably want to unfreeze this if insert position is size
+            if insert_position != 6:
+                freeze_module_params(self.embed_positions)
             freeze_module_params(self.emb_layer_norm)
 
         for layer in range(n_trans_layers_to_freeze):
@@ -281,7 +301,7 @@ class TransformerSentenceEncoder(nn.Module):
                     self.word2idx[word] = np.array(line[1:]).astype(np.float)
             self.generator_dim = int(glove_path.split('.')[-2][:-1])
         elif sentence_generation == 'roberta':
-            self.generator_dim = 1024
+            self.generator_dim = embedding_dim
 
         self.insert_position = insert_position
         self.generation_net = generation_net
@@ -380,13 +400,17 @@ class TransformerSentenceEncoder(nn.Module):
                     else:
                         if generation_quaternions is not None:
                             if lphm is None:
+
+                                # the B matrices and the bias
                                 self.generation_dense_w = ParameterList([Parameter(torch.empty(self.generator_dim // generation_quaternions, self.phm_bottleneck_dim // generation_quaternions, requires_grad=True)) for i in range(generation_quaternions)])
                                 self.generation_dense_b = Parameter(torch.empty(self.phm_bottleneck_dim, requires_grad=True))
 
-
+                                # The B matrices and the bias
+                                # print("self suffix length", self.suffix_len)
                                 self.generation_out_proj_w = ParameterList([Parameter(torch.empty(self.phm_bottleneck_dim // generation_quaternions, self.prompt_insert_mode * self.suffix_len * self.embedding_dim // generation_quaternions, requires_grad=True)) for i in range(generation_quaternions)])
                                 self.generation_out_proj_b = nn.Embedding(self.suffix_len * self.prompt_insert_mode, self.embedding_dim)
 
+                                # A in the phm setup
                                 self.generation_shared_w1 = ParameterList([Parameter(torch.empty(generation_quaternions, generation_quaternions, requires_grad=True)) for i in range(generation_quaternions)])
                                 self.generation_shared_w2 = ParameterList([Parameter(torch.empty(generation_quaternions, generation_quaternions, requires_grad=True)) for i in range(generation_quaternions)])
 
@@ -619,13 +643,13 @@ class TransformerSentenceEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # add [CLS], [SEP] into generated prompt
         # T x 5 x C -> T x 7 x C
-        new_x = torch.cat([self.embed_tokens(torch.LongTensor([0]).to('cuda:0')).repeat(x.shape[0], 1).type_as(x).view(x.shape[0], -1, x.shape[-1]), x, self.embed_tokens(torch.LongTensor([2]).to('cuda:0')).repeat(x.shape[0], 1).type_as(x).view(x.shape[0], -1, x.shape[-1])], dim=1)
+        new_x = torch.cat([self.embed_tokens(torch.LongTensor([0]).to(f"cuda:{self.args.device_id}")).repeat(x.shape[0], 1).type_as(x).view(x.shape[0], -1, x.shape[-1]), x, self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")).repeat(x.shape[0], 1).type_as(x).view(x.shape[0], -1, x.shape[-1])], dim=1)
 
         # compute padding mask. This is needed for multi-head attention
         padding_mask = None
 
         if self.embed_positions is not None:
-            zeros = torch.zeros(x.shape[0], self.suffix_len + 2).to('cuda:0')
+            zeros = torch.zeros(x.shape[0], self.suffix_len + 2).to(f"cuda:{self.args.device_id}")
             new_x += self.embed_positions(zeros, positions=positions)
 
         if self.segment_embeddings is not None and segment_labels is not None:
@@ -673,18 +697,26 @@ class TransformerSentenceEncoder(nn.Module):
         last_state_only: bool = False,
         positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        if tokens.size()[1] > 292:
+            print("more than half the original max tokens size")
+            print('tokens size', tokens.size())
+            raise MemoryError
+        print('tokens size', tokens.size())
+        # print('token', tokens)
         padding_mask = tokens.eq(self.padding_idx)
         if not self.traceable and not self.tpu and not padding_mask.any():
             padding_mask = None
         if self.sentence_generation is not None:
             if self.sentence_generation == 'roberta':
-                x = self.embed_tokens(tokens)
+                x = self.embed_tokens(tokens) # embed the tokens
 
                 if self.embed_scale is not None:
-                    x *= self.embed_scale
+                    x *= self.embed_scale # scale embeddings
 
                 if self.embed_positions is not None:
                     x += self.embed_positions(tokens, positions=positions)
+                    # add positional embeddings
 
                 if self.segment_embeddings is not None and segment_labels is not None:
                     x += self.segment_embeddings(segment_labels)
@@ -706,52 +738,111 @@ class TransformerSentenceEncoder(nn.Module):
 
                 for layer in self.layers:
                     x, _ = layer(x, self_attn_padding_mask=padding_mask)
+                    # x = x.to('cpu').
+                    # x = x.to(f"cuda:{self.args.device_id}")
 
                 inner_states = [x]
+                torch.cuda.empty_cache()
             else:
                 x = np.array([])
                 x = np.zeros((tokens.size()[0], self.generator_dim), dtype='float32' if self.generation_shared_w1[0][0].dtype==torch.float32 else 'half')
                 for i in range(tokens.size()[0]):
                     x[i] += self.glove_encode(self.decode(tokens[i]))
-                x = torch.from_numpy(x).to('cuda:0')
+                x = torch.from_numpy(x).to(f"cuda:{self.args.device_id}")
                 inner_states = [x]
 
         x = self.embed_tokens(tokens)
+        x = x.to('cpu').detach()
+        # print('moved x to cpu')
+        # print("we have done forward pass once")
+
+        torch.cuda.empty_cache()
 
         if self.add_suffix:
             if self.sentence_generation is not None:
                 if self.generation_net == 'dnn':
                     if self.sentence_generation == 'roberta':
                         features = inner_states[-1].transpose(0, 1)[:, 0, :]
+                        # get the first token for all of the batches
                     else:
                         features = inner_states[-1]
+
+                    if not features.is_cuda:
+                        features = features.to(f"cuda:{self.args.device_id}")
+
                     suffix_x = self.generation_dropout(features)
+                    # suffix_x = suffix_x.to("cpu")
+                    #suffix x is size B x C
 
                     if self.middle_prompt_insert_layer < 24 and not self.middle_previous:
-                        suffix_x0 = suffix_x.clone() 
+                        suffix_x0 = suffix_x.clone() # we dont seem to enter here
 
                     if self.generator_residual:
+
+                        # repeats 5 times in the second dimension, so becomes like b x (c * 5)
+                        # then reshape to B x 5 x C
                         residual_x = suffix_x.repeat(1, 5).view(suffix_x.size()[0], 5, self.generator_dim)
 
                     if self.generation_quaternions is not None:
-                        tmp_x = self.generation_dense_b.repeat(suffix_x.size()[0], 1).to('cuda:0')
+                        
+                        # dont put tmp_x on device
+                        tmp_x = self.generation_dense_b.repeat(suffix_x.size()[0], 1).to(f"cuda:{self.args.device_id}")
+                        
+                        # tmp_x = self.generation_dense_b.repeat(suffix_x.size()[0], 1)
+                        # if tmp_x.is_cuda:
+                        #     tmp_x = tmp_x.to('cpu')
+                        
+                        
+                        # for each batch, store the bias weights
+                        # shape B x m
+                        
                         for i in range(self.generation_quaternions):
+                            # for i in n (phm setup in paper)
+
+                            # suffix_x = suffix_x.to(f"cuda:{self.args.device_id}")
                             if self.lphm is None:
-                                tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to('cuda:0'))
+
+                                # this basically passes x through the first layer of phm
+                                tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to(f"cuda:{self.args.device_id}"))
+                                #tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to(f"cuda:{self.args.device_id}")).to('cpu')
                             else: 
-                                tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to('cuda:0'))
+                                tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to(f"cuda:{self.args.device_id}"))
+                            # suffix_x = suffix_x.to('cpu')
+                        
+                        torch.cuda.empty_cache()
+                        # suffix_x = suffix_x.to(f"cuda:{self.args.device_id}")
+                        print(suffix_x.device, "suffix x device")
                         suffix_x = self.generation_activation_fn(tmp_x)
                         suffix_x = self.generation_dropout(suffix_x)
+                        # should be shape b x m 
+                        # activation and dropout
 
-                        tmp_x = self.generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(suffix_x.size()[0], 1).to('cuda:0')
+                        # grab the bias for each token from embedding matrix
+                        # shape t x d. view(-1) flattens to a 1d of length t x d
+                        # then repeats for batch size so for each batch we have t x d vector 
+                        # thus shape is B x (t * d)
+                        # tmp_x = self.generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(suffix_x.size()[0], 1).to(f"cuda:{self.args.device_id}")
+                        tmp_x = self.generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(suffix_x.size()[0], 1)
+                        # if tmp_x.is_cuda:
+                        #     tmp_x = tmp_x.to('cpu')
 
                         for i in range(self.generation_quaternions):
                             if self.lphm is None:
-                                tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to('cuda:0'))
+                                tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to(f"cuda:{self.args.device_id}"))
+                                #tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to(f"cuda:{self.args.device_id}")).to("cpu")
                             else:
-                                tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to('cuda:0'))
+                                tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to(f"cuda:{self.args.device_id}"))
 
+
+                    
+                        # pass through the second layer of phm 
+                        # should be shape B x (t * d)
+                        # now we can then probably reshape to be B x t x d. I understand it now
                         suffix_x = tmp_x
+                        print("suffix device", suffix_x.device)
+                        if suffix_x.is_cuda:
+                            suffix_x = suffix_x.to('cpu').detach()
+                        torch.cuda.empty_cache()
                         # 16 x 5120
                     else:
                         suffix_x = self.generation_dense(suffix_x)
@@ -760,11 +851,12 @@ class TransformerSentenceEncoder(nn.Module):
                         if self.generation_layer == 2:
                             suffix_x = self.generation_out_proj(suffix_x)
                             if self.middle_prompt_insert_layer != 25:
-                                suffix_x += self.middle_generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(suffix_x.size()[0], 1).to('cuda:0')
+                                suffix_x += self.middle_generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(suffix_x.size()[0], 1).to(f"cuda:{self.args.device_id}")
 
+                    # reshape to B x suffix_len x d
                     if self.generator_residual:
                         suffix_x = residual_x + self.residual_layer_norm(suffix_x.view(tokens.size()[0], -1, self.embedding_dim))
-                    else:
+                    else:  # we enter here
                         suffix_x = suffix_x.view(tokens.size()[0], -1, self.embedding_dim)
 
                     if self.generator_layer_norm != False:
@@ -794,22 +886,134 @@ class TransformerSentenceEncoder(nn.Module):
                     self.output_embeds = self.re_mlp_head(self.re_lstm_head(input_embeds)[0]).squeeze()
                 else:
                     suffix_x = self.suffix_embed(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).repeat(tokens.size()[0], 1).view(-1, self.suffix_len * self.prompt_insert_mode, self.embedding_dim)
-
+            
+            # print("we have finished creating the suffix")
+            torch.cuda.empty_cache()
+            # we eval to true 
             if self.prompt_insert_mode == 1:
+                if x.is_cuda:
+                    x = x.to("cpu")
                 new_x = []
                 new_padding_mask = []
-                self.stop_idxs = []
+                self.stop_idxs = []  # very important
+                missing_padding_lengths = []
+                # print('suffix_x shape')
+                # print(suffix_x.shape)
+
+
+                # if self.insert_position == 6:
+                #     # find the last stop token
+
+                #     largest_last_sep_index = 0
+                #     for i in range(tokens.size()[0]):
+                #         for last_sep_index in range(tokens.size()[1] - 1, tmp, -1):
+                #             if tokens[i][last_sep_index] == 2:
+                #                 largest_last_sep_index = max(largest_last_sep_index, last_sep_index)
+                #                 break
+                        
+
+                # this should be iterating through the batch because
+                # tokens size should be B x T
+                length_of_suffix_added = 0
+                if self.insert_position == 6:
+                    actual_suffix_length = self.suffix_len // (self.original_max_positions)
+
+
+                    # print("updating and saving length of suffix added")
+                    length_of_suffix_added = (tokens.size()[1]) * actual_suffix_length 
+                # print('length of suffix added', length_of_suffix_added)
+                
+                # print("length of suffix added", length_of_suffix_added)
+                # print(length_of_suffix_added_tmp, "length of suffix added temp")
+                # print("largest last sep index", largest_last_sep_index)
                 for i in range(tokens.size()[0]):
+
+                    # iterate through sequence length, break once we find the first separator token
                     for stop_idx in range(tokens.size()[1]):
                         if tokens[i][stop_idx] == 2:
                             break
                     if self.insert_position == 0:
                         if self.reparameterization != 'None':
                             new_x.append(torch.cat((x[i][:1], self.output_embeds, x[i][1:]), 0))
-                        else:
+                        else: # we enter
+                            # we add the batch suffix in desired position 
                             new_x.append(torch.cat((x[i][:1], self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], x[i][1:]), 0))
 
                         stop_idx = 1
+                    elif self.insert_position == 5:
+                        # print(self.insert_position, "insert position is five, custom insertion")
+                        # we will specify a place in the input sequence with a fraction
+                        insertion_index_fraction = int(self.custom_insert_position_fraction * x[i].shape[0])
+                        # print(insertion_index_fraction, "actual insertion index")
+                        if self.reparameterization != 'None':
+                            new_x.append(torch.cat((x[i][:insertion_index_fraction], self.output_embeds, x[i][insertion_index_fraction:]), 0))
+                        else:
+                            new_x.append(torch.cat((x[i][:insertion_index_fraction], self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], x[i][insertion_index_fraction:]), 0))
+
+                        stop_idx = insertion_index_fraction
+                    elif self.insert_position == 6:
+
+                        tmp = stop_idx
+
+                        # length_of_suffix_added_tmp =  0
+
+                        largest_last_sep_index = tokens.size()[1] - 1
+
+
+
+                      
+
+                        #find the last stop token
+                        for last_sep_index in range(tokens.size()[1] - 1, -1, -1):
+                            if tokens[i][last_sep_index] == 2:
+                                break
+                        
+                        
+                        
+                        # we need to insert at every position, and we need stop indexes for every position
+                        input_stop_idxs = []
+                        intermediate_x = None
+                        for j in range(last_sep_index):
+                            if intermediate_x is None:
+                                intermediate_x = torch.cat((x[i][j:j + 1], suffix_x[i][j * actual_suffix_length: (j + 1) * actual_suffix_length]), 0 )
+                            else:
+                                intermediate_x = torch.cat((intermediate_x, x[i][j:j + 1], suffix_x[i][j * actual_suffix_length: (j + 1) * actual_suffix_length]), 0 )
+
+                            # if last_sep_index == largest_last_sep_index:
+                            #     length_of_suffix_added_tmp += actual_suffix_length
+                            input_stop_idxs.append(j + 1)
+                        
+                        # intermediate_x = torch.cat((intermediate_x, x[i][last_sep_index: last_sep_index + 1], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")), suffix_x[i][largest_last_sep_index * actual_suffix_length: (largest_last_sep_index + 1) * actual_suffix_length],  self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")), x[i][last_sep_index+1:]   ))
+                        intermediate_x = torch.cat((intermediate_x, x[i][last_sep_index: last_sep_index + 1], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")).to("cpu"), suffix_x[i][largest_last_sep_index * actual_suffix_length: (largest_last_sep_index + 1) * actual_suffix_length],  self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")).to("cpu"), x[i][last_sep_index+1:]   ))
+                        input_stop_idxs.append(last_sep_index + 2)
+                        stop_idx = input_stop_idxs
+
+                        if last_sep_index == largest_last_sep_index:
+                            # length_of_suffix_added_tmp += actual_suffix_length
+                            missing_padding_lengths.append(0)
+                        else:  # otherwise, we need to pad with ones
+                            # calculate the length of the longest input in this batch. 
+
+                            new_longest_input_length = (tokens.size()[1] * actual_suffix_length) + 2 + tokens.size()[1]
+                            missing_padding_length = new_longest_input_length - intermediate_x.size(0)
+                            missing_padding_lengths.append(missing_padding_length)
+                            # missing_padding_length_ones = self.embed_tokens(torch.ones((missing_padding_length), dtype = torch.long).to(f"cuda:{self.args.device_id}"))
+                            missing_padding_length_ones = self.embed_tokens(torch.ones((missing_padding_length), dtype = torch.long).to(f"cuda:{self.args.device_id}")).to("cpu")
+                            intermediate_x = torch.cat((intermediate_x, missing_padding_length_ones))
+
+                        torch.cuda.empty_cache()
+
+
+                        # new_x.append(torch.cat((x[i][:stop_idx+1], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")), self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")), x[i][stop_idx+1:]), 0))
+                        # stop_idx = stop_idx + 2
+
+                        # assert intermediate_x.size()[0] == (actual_suffix_length * x.size()[1]) + x.size()[1]
+                        # print("intermediate x device", intermediate_x.device)
+                        new_x.append(intermediate_x)
+
+
+
+
                     elif self.insert_position == 1:
                         new_x.append(torch.cat((x[i][:stop_idx], self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], x[i][stop_idx:]), 0))
                     elif self.insert_position == 2:
@@ -823,55 +1027,141 @@ class TransformerSentenceEncoder(nn.Module):
                         new_x.append(torch.cat((x[i][:stop_idx], self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], x[i][stop_idx:]), 0))
                     else:
                         tmp = stop_idx
+
+                        # find the last stop token
                         for stop_idx in range(tokens.size()[1] - 1, tmp, -1):
                             if tokens[i][stop_idx] == 2:
                                 break
-                        new_x.append(torch.cat((x[i][:stop_idx+1], self.embed_tokens(torch.LongTensor([2]).to('cuda:0')), self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], self.embed_tokens(torch.LongTensor([2]).to('cuda:0')), x[i][stop_idx+1:]), 0))
+                        new_x.append(torch.cat((x[i][:stop_idx+1], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")).to('cpu'), self.suffix_embed(torch.arange(self.suffix_len).type_as(tokens)) if self.sentence_generation is None else suffix_x[i], self.embed_tokens(torch.LongTensor([2]).to(f"cuda:{self.args.device_id}")).to('cpu'), x[i][stop_idx+1:]), 0))
                         stop_idx = stop_idx + 2
                     self.stop_idxs.append(stop_idx)
 
                     #torch.arange(self.suffix_len).type_as(tokens)
-                    if padding_mask is not None:
-                        if self.insert_position != 4:
+                    # print("padding mask", padding_mask)
+                    if padding_mask is not None:  # if there is padding tokens in the input
+                        # print("we entered the padding mask section")
+                        if self.insert_position in [0, 1,2,3,5]:
                             zeros = torch.zeros(self.suffix_len).type_as(padding_mask)
+
+                        elif self.insert_position == 6:
+                            zeros = torch.zeros(length_of_suffix_added + 2).type_as(padding_mask)
                         else:
                             zeros = torch.zeros(self.suffix_len + 2).type_as(padding_mask)
-                        new_padding_mask.append(torch.cat((padding_mask[i][:stop_idx], zeros, padding_mask[i][stop_idx:]), dim=-1))
+
+
+                        # print("zeros device", zeros.device)
+
+
+                        if self.insert_position != 6:
+                            new_padding_mask.append(torch.cat((padding_mask[i][:stop_idx], zeros, padding_mask[i][stop_idx:]), dim=-1))
+                        else:
+                            intermediate_new_padding_mask = None
+                            for ix, stop_indexes in enumerate(stop_idx[:-1]):
+                                if intermediate_new_padding_mask is None:
+                                    intermediate_new_padding_mask = torch.cat((padding_mask[i][:stop_indexes], zeros[ix*actual_suffix_length:actual_suffix_length*(ix + 1)]), dim = -1)
+                                else:
+                                    intermediate_new_padding_mask = torch.cat((intermediate_new_padding_mask, padding_mask[i][stop_idx[ix -1]:stop_indexes], zeros[ix*actual_suffix_length:actual_suffix_length*(ix + 1)]), dim = -1)
+                            
+                            ix = len(stop_idx) - 1
+                            stop_indexes = stop_idx[-1]
+                            intermediate_new_padding_mask = torch.cat((intermediate_new_padding_mask, padding_mask[i][stop_idx[ix -1]:stop_indexes], zeros[ix*actual_suffix_length:actual_suffix_length*(ix + 1) + 2], padding_mask[i][stop_indexes: ]), dim = -1)
+                            
+                            if actual_suffix_length*(ix + 1) + 2 < zeros.size()[0]:
+                                padding_ones = torch.ones((zeros.size()[0] - (actual_suffix_length*(ix + 1) + 2) )).type_as(intermediate_new_padding_mask)
+                                # print("length of padding ones", len(padding_ones))
+                                # print("length of zeros", len(zeros))
+                                # print("length of padding added for suffix for current input", actual_suffix_length*(ix + 1) + 2)
+                                intermediate_new_padding_mask = torch.cat((intermediate_new_padding_mask, padding_ones), dim = -1)
+                            
+                            # print("intermediate padding mask device", intermediate_new_padding_mask.device)
+                            new_padding_mask.append(intermediate_new_padding_mask)
+                            
+                            # print("padding of the longest input", length_of_suffix_added + 2 + padding_mask.size()[-1])
+
+                            # print('padding size of the current input', intermediate_new_padding_mask.size()[-1])
+                            assert intermediate_new_padding_mask.size()[-1] == length_of_suffix_added + 2 + padding_mask.size()[-1]
+                            # assert True is False
+
                 x = torch.stack(new_x)
                 if padding_mask is not None:
                     padding_mask = torch.stack(new_padding_mask)
+                torch.cuda.empty_cache()
         else:
             suffix_x = None
+
+        # print("we have finished adding the suffix to the input")
 
         if self.embed_scale is not None:
             x *= self.embed_scale
         else:
             self.embed_scale = 1.0
 
+        # if the number of tokens exceeds 512 then truncate. probably change this to max_seq_len
         exceed_len = False
-        if x.size()[1] > 512:
-            print(x.size())
-            x = x[:, :512]
-            print(x.size())
-            print(padding_mask.size())
-            if padding_mask is not None:
-                padding_mask = padding_mask[:,:512]
-            print(padding_mask.size())
 
-            exceed_len = True
+        # print(self.max_seq_len, "max sequence length")
+        if self.insert_position == 6:
+            if x.size()[1] > self.max_seq_len:
+                print(x.size())
+                x = x[:, :self.max_seq_len]
+                print(x.size())
+                print(padding_mask.size())
+                if padding_mask is not None:
+                    padding_mask = padding_mask[:,:self.max_seq_len]
+                print(padding_mask.size())
+
+                exceed_len = True
+
+        else:
+            if x.size()[1] > 512:
+                print(x.size())
+                x = x[:, :512]
+                print(x.size())
+                print(padding_mask.size())
+                if padding_mask is not None:
+                    padding_mask = padding_mask[:,:512]
+                print(padding_mask.size())
+
+                exceed_len = True
 
 
+
+        # if tokens.is_cuda:
+        #     tokens = tokens.to('cpu') 
+
+        x = x.to(f"cuda:{self.args.device_id}")
+        
+        
+        torch.cuda.empty_cache()      
+        # maybe rewrite this, when zeros are added at the start and not at the position of the prompt we add
         if self.embed_positions is not None:
             if self.add_suffix and self.prompt_insert_mode == 1:
-                if self.insert_position != 4:
-                    zeros = torch.zeros(x.shape[0], self.suffix_len).type_as(tokens)
+                if self.insert_position in [0,1,2,3,5]:
+                    zeros = torch.zeros(x.shape[0], self.suffix_len).type_as(tokens).to(f"cuda:{self.args.device_id}")
+                    # zeros = torch.zeros(x.shape[0], self.suffix_len).type_as(tokens)
+                elif self.insert_position == 6:
+                    zeros = torch.zeros(x.shape[0], length_of_suffix_added + 2).to(f"cuda:{self.args.device_id}")
+                    # zeros = torch.zeros(x.shape[0], length_of_suffix_added + 2)
+                
                 else:
-                    zeros = torch.zeros(x.shape[0], self.suffix_len + 2).type_as(tokens)
+                    # zeros = torch.zeros(x.shape[0], self.suffix_len + 2).type_as(tokens)
+                    zeros = torch.zeros(x.shape[0], self.suffix_len + 2).type_as(tokens).to(f"cuda:{self.args.device_id}")
+                
+                
                 tokens = torch.cat([zeros, tokens], dim=-1)
                 if exceed_len:
-                    tokens = tokens[:, :512]
+                    if self.insert_position == 6:
+                        tokens = tokens[:, :self.max_seq_len]
+                    else:
+                        tokens = tokens[:, :512]  # probably also need to change this to max seq len
 
+            # if not tokens.is_cuda:
+            #     tokens = tokens.to(f"cuda:{self.args.device_id}")
+            # if not x.is_cuda:
+            #     x = x.to(f"cuda:{self.args.device_id}")
             x += self.embed_positions(tokens, positions=positions)
+        torch.cuda.empty_cache()
+        # print("we have finished adding the embed positions")
 
         if self.segment_embeddings is not None and segment_labels is not None:
             # TODO: if segment_labels is not None needs to shift
@@ -889,6 +1179,8 @@ class TransformerSentenceEncoder(nn.Module):
         if padding_mask is not None:
             x *= 1 - padding_mask.unsqueeze(-1).type_as(x)
 
+        # x = x.to("cpu")
+
         # B x T x C -> T x B x C
 
         x = x.transpose(0, 1)
@@ -899,7 +1191,9 @@ class TransformerSentenceEncoder(nn.Module):
         if not last_state_only:
             inner_states.append(x)
 
+        print("preparing for second forward pass")
         for idx, layer in enumerate(self.layers):
+            # print(f"layer: {idx}  in forward pass")
             if self.prompt_insert_mode == 1:
                 suffix_x = None
             if self.adapter_arch == 'compacter':
@@ -907,6 +1201,7 @@ class TransformerSentenceEncoder(nn.Module):
                     compacter_n=self.compacter_n
                     tmp_id = idx + 1 - self.adapter_insert_layer
                     tmp_idx = (idx + 1 - self.adapter_insert_layer) * compacter_n * 2
+                    
                     x, _ = layer(x,
                                  self_attn_padding_mask=padding_mask,
                                  compacter_n=self.compacter_n,
@@ -927,6 +1222,8 @@ class TransformerSentenceEncoder(nn.Module):
                                  compacter_up_proj_b2=self.compacter_up_proj_b(torch.arange(tmp_id*2+1,tmp_id*2+2).type_as(tokens)),
                                  compacter_shared_A2=self.compacter_shared_A[tmp_idx+compacter_n:tmp_idx+compacter_n*2],)
             else:
+
+                # if we are at last layer before the adapter insert create adapter insert otherwise done
                 if idx + 1 >= self.adapter_insert_layer:
                     if self.adapter_arch == 'houlsby':
                         adapter_MLP2 = self.middle_adapter_MLP2[idx + 1 - self.adapter_insert_layer]
@@ -937,66 +1234,118 @@ class TransformerSentenceEncoder(nn.Module):
                     adapter_MLP = None
                     adapter_MLP2 = None
 
+                torch.cuda.empty_cache()
+                # look into how the suffix x affects the forward pass
+                # if not x.is_cuda:
+                #     x = x.to(f"cuda:{self.args.device_id}")
                 x, _ = layer(x, self_attn_padding_mask=padding_mask, suffix_x=suffix_x, adapter_MLP=adapter_MLP, adapter_MLP2=adapter_MLP2, adapter_arch=self.adapter_arch)
+                # x = x.to("cpu")
+                torch.cuda.empty_cache()
 
+            # if we are not at the adapter insert layer
             if idx + 1 >= self.middle_prompt_insert_layer and idx < 23:
                 # middle_prompt_insert_layer is between [1, 23]
                 # layer 0 is already done
                 # layer 24 has no affect with cls token, so no need to insert
-                if self.sentence_generation is not None:
-                    if self.middle_previous:
+                if self.sentence_generation is not None: #we enter here
+                    if self.middle_previous:  # true so we enter here. 
+                        
+                        # first token for all batches and rep dimensions
+                        # shape B X C
                         suffix_x = x[0, :, :].clone()
                     else:
                         suffix_x = suffix_x0.clone()
 
+                    torch.cuda.empty_cache()
                     if self.generation_quaternions is not None:
                         if self.middle_prompt_mode == 'none':
-                            tmp_x = self.middle_generation_dense_b[idx].repeat(tokens.shape[0], 1).to('cuda:0')
+                            tmp_x = self.middle_generation_dense_b[idx].repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
                             # 16 x 256
                             for i in range(self.generation_quaternions):
                                 if self.lphm is None:
-                                    tmp_x += torch.mm(suffix_x, torch.kron(self.middle_generation_shared_w1[idx * self.generation_quaternions + i], self.middle_generation_dense_w[idx * self.generation_quaternions + i]).to('cuda:0'))
+                                    tmp_x += torch.mm(suffix_x, kron(self.middle_generation_shared_w1[idx * self.generation_quaternions + i], self.middle_generation_dense_w[idx * self.generation_quaternions + i]).to(f"cuda:{self.args.device_id}"))
                                 else: 
-                                    tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to('cuda:0'))
+                                    tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to(f"cuda:{self.args.device_id}"))
                         else:
                             # for shared mode and layerb mode
-                            tmp_x = self.generation_dense_b.repeat(tokens.shape[0], 1).to('cuda:0')
+
+                            # repeat for the batch
+                            # 
+                            # # shape  B x m
+                            tmp_x = self.generation_dense_b.repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
+                            # tmp_x = self.generation_dense_b.repeat(tokens.shape[0], 1).to('cpu')
+                            
                             for i in range(self.generation_quaternions):
                                 if self.lphm is None:
-                                    tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to('cuda:0'))
+                                    tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to(f"cuda:{self.args.device_id}"))
+                                    # tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w1[i], self.generation_dense_w[i]).to(f"cuda:{self.args.device_id}")).to('cpu')
                                 else: 
-                                    tmp_x += torch.mm(suffix_x, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to('cuda:0'))
+                                    tmp_x += torch.mm(suffix_x, kron(self.generation_shared_w[i], torch.mm(self.generation_dense_s[i], self.generation_dense_t[i])).to(f"cuda:{self.args.device_id}"))
 
+                        # both shape B x M
+                        torch.cuda.empty_cache()
+                        # if not tmp_x.is_cuda:
+                        #     tmp_x = tmp_x.to(f"cuda:{self.args.device_id}")
                         suffix_x1 = self.generation_activation_fn(tmp_x)
                         suffix_x2 = self.generation_dropout(suffix_x1)
                         # 16 x 256
+
+
                         if self.middle_prompt_mode == 'none' or self.middle_prompt_mode == 'layerb':
-                            tmp_x1 = self.middle_generation_out_proj_b(torch.arange(idx * self.suffix_len * self.prompt_insert_mode, (idx + 1) * self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to('cuda:0')
+
+                            # shape B x (suffix_len * d)
+                            # tmp_x1 = self.middle_generation_out_proj_b(torch.arange(idx * self.suffix_len * self.prompt_insert_mode, (idx + 1) * self.suffix_len * self.prompt_insert_mode,).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
+                            tmp_x1 = self.middle_generation_out_proj_b(torch.arange(idx * self.suffix_len * self.prompt_insert_mode, (idx + 1) * self.suffix_len * self.prompt_insert_mode, dtype = torch.long).to(f"cuda:{self.args.device_id}")).view(-1).repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
+                            # tmp_x1 = self.middle_generation_out_proj_b(torch.arange(idx * self.suffix_len * self.prompt_insert_mode, (idx + 1) * self.suffix_len * self.prompt_insert_mode, dtype = torch.long).to(f"cuda:{self.args.device_id}")).view(-1).repeat(tokens.shape[0], 1).to('cpu')
                         else:
                             # for shared mode
-                            tmp_x1 = self.generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to('cuda:0')
+                            tmp_x1 = self.generation_out_proj_b(torch.arange(self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
                         
                         if self.middle_prompt_mode == 'none':
                             for i in range(self.generation_quaternions):
                                 if self.lphm is None:
-                                    tmp_x1 += torch.mm(suffix_x2, torch.kron(self.middle_generation_shared_w2[idx * self.generation_quaternions + i], self.middle_generation_out_proj_w[idx * self.generation_quaternions + i]).to('cuda:0'))
+                                    tmp_x1 += torch.mm(suffix_x2, kron(self.middle_generation_shared_w2[idx * self.generation_quaternions + i], self.middle_generation_out_proj_w[idx * self.generation_quaternions + i]).to(f"cuda:{self.args.device_id}"))
                                 else:
-                                    tmp_x1 += torch.mm(suffix_x2, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to('cuda:0'))
+                                    tmp_x1 += torch.mm(suffix_x2, kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to(f"cuda:{self.args.device_id}"))
                         else:
                             for i in range(self.generation_quaternions):
                                 if self.lphm is None:
-                                    tmp_x1 += torch.mm(suffix_x2, torch.kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to('cuda:0'))
+                                    tmp_x1 += torch.mm(suffix_x2, kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to(f"cuda:{self.args.device_id}"))
+                                    # tmp_x1 += torch.mm(suffix_x2, kron(self.generation_shared_w2[i], self.generation_out_proj_w[i]).to(f"cuda:{self.args.device_id}")).to("cpu")
                                 else:
-                                    tmp_x1 += torch.mm(suffix_x2, torch.kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to('cuda:0'))
+                                    tmp_x1 += torch.mm(suffix_x2, kron(self.generation_shared_w[i], torch.mm(self.generation_out_proj_s[i], self.generation_out_proj_t[i])).to(f"cuda:{self.args.device_id}"))
                         
+
+                        # shape suffix_len X B x d
                         layer_prompt = tmp_x1.view(-1, self.suffix_len * self.prompt_insert_mode, self.embedding_dim).transpose(0, 1)
+                        # print(layer_prompt.device, "layer prompt device")
+                        torch.cuda.empty_cache()
+                        # print("we have generated the layer prompt")
+
+                        # if self.insert_position == 6:
+                            # maybe we truncate
+
                         # 5 x 16 x 1024
-                        if self.prompt_insert_mode != 2:
-                            for i in range(layer_prompt.size()[1]):
-                                x[self.stop_idxs[i]:self.stop_idxs[i]+self.suffix_len, i] += layer_prompt[:,i]
+
+
+                        if self.prompt_insert_mode != 2: # we wnter here 
+
+                            if self.insert_position != 6:
+                                for i in range(layer_prompt.size()[1]): # for each batch, add in the layer prompt to the input
+                                    x[self.stop_idxs[i]:self.stop_idxs[i]+self.suffix_len, i] += layer_prompt[:,i]   # we add the layer prompt ontop of the input
+                            else:
+
+                                for i in range(layer_prompt.size()[1]):
+                                    stop_idx = self.stop_idxs[i]
+                                    for j, stop_indexes in enumerate(stop_idx):
+                                        x[stop_indexes:stop_indexes+ actual_suffix_length, i] += layer_prompt[j * actual_suffix_length:(j+1)*actual_suffix_length,i]
+                            torch.cuda.empty_cache()
+                            # print('we have added the layer prompt to x')
                         else:
                             suffix_x = layer_prompt
                     else:
+
+
                         if self.middle_prompt_mode == 'layerb':
                             suffix_x = self.generation_dense(suffix_x)
                             suffix_x = self.generation_activation_fn(suffix_x)
@@ -1004,13 +1353,14 @@ class TransformerSentenceEncoder(nn.Module):
                             if self.generation_layer == 2:
                                 suffix_x = self.generation_out_proj(suffix_x)
                                 if self.middle_prompt_insert_layer != 25:
-                                    suffix_x += self.middle_generation_out_proj_b(torch.arange((idx + 1) * self.suffix_len * self.prompt_insert_mode, (idx + 2) * self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to('cuda:0')
+                                    suffix_x += self.middle_generation_out_proj_b(torch.arange((idx + 1) * self.suffix_len * self.prompt_insert_mode, (idx + 2) * self.suffix_len * self.prompt_insert_mode).type_as(tokens)).view(-1).repeat(tokens.shape[0], 1).to(f"cuda:{self.args.device_id}")
                         else:
-                            #suffix_x = torch.ones(suffix_x.size()[0], suffix_x.size()[1]).to('cuda:0')
+                            #suffix_x = torch.ones(suffix_x.size()[0], suffix_x.size()[1]).to(f"cuda:{self.args.device_id}")
                             suffix_x = self.middle_generation_dense[22 - idx](suffix_x)
                             suffix_x = self.generation_activation_fn(suffix_x)
                             suffix_x = self.generation_dropout(suffix_x)
                             suffix_x = self.middle_generation_out_proj[22 - idx](suffix_x)
+
 
                         layer_prompt = suffix_x.view(-1, self.suffix_len * self.prompt_insert_mode, self.embedding_dim).transpose(0, 1)
                         if self.prompt_insert_mode != 2:
@@ -1035,6 +1385,9 @@ class TransformerSentenceEncoder(nn.Module):
             if not last_state_only:
                 inner_states.append(x)
 
+        print("we got past second forward pass")
+
+        torch.cuda.empty_cache()
         sentence_rep = x[0, :, :]
 
         if last_state_only:

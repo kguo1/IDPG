@@ -7,6 +7,7 @@ parser.add_argument("-o", "--output_file", default="/data/home/zhuofeng/result/c
 parser.add_argument("-n", "--number", default="1", help="the seed number")
 parser.add_argument("-f", "--froms", default="0")
 parser.add_argument("-t", "--to", default="0")
+parser.add_argument('-t2', "--to2", default = "0")
 parser.add_argument("-k", "--kn", default="")
 parser.add_argument("-d", "--data_file", default="data/cr-test.csv", help="the data")
 parser.add_argument("-l", "--klr", default="1e-2")
@@ -44,4 +45,4 @@ print('ncorrect / nsamples = ' + str(ncorrect) + ' / ' + str(nsamples))
 print('| Accuracy: ', float(ncorrect)/float(nsamples))
 
 with open(args.output_file, 'a') as outf:
-    outf.write('cr: ' + args.froms + '-' + args.to + '-' + args.number + '-' + args.klr + '| Accuracy: ' + str(float(ncorrect)/float(nsamples)) + '\n')
+    outf.write('cr ' + args.froms + '-' + args.to + '-' + args.to2 + '-' + args.number + '-' + args.klr + '| Accuracy: ' + str(float(ncorrect)/float(nsamples)) + '\n')

@@ -39,12 +39,17 @@ logger = logging.getLogger("fairseq_cli.train")
 
 
 def main(args, init_distributed=False):
+
+    
     utils.import_user_module(args)
 
+    # clarify what max tokens and max-sentences do
     assert (
         args.max_tokens is not None or args.max_sentences is not None
     ), "Must specify batch size either with --max-tokens or --max-sentences"
     metrics.reset()
+
+    print('entered main')
 
     # Initialize CUDA and distributed training
     if torch.cuda.is_available() and not args.cpu and not getattr(args, "tpu", False):
@@ -62,6 +67,14 @@ def main(args, init_distributed=False):
 
     # Setup task, e.g., translation, language modeling, etc.
     task = tasks.setup_task(args)
+
+    if args.insert_position == 6:
+        args.suffix_len *= max((args.max_positions // 2), 292)
+
+    print(args.device_id, "args device id")
+    print(args.distributed_rank, "args distributed rank")
+    
+    print("suffix length", args.suffix_len)
 
     # Load valid dataset (we load training data below, based on the latest checkpoint)
     for valid_sub_split in args.valid_subset.split(","):
@@ -120,6 +133,8 @@ def main(args, init_distributed=False):
     lr = trainer.get_lr()
     train_meter = meters.StopwatchMeter()
     train_meter.start()
+    print(epoch_itr.next_epoch_idx)
+    print("started training")
     while lr > args.min_lr and epoch_itr.next_epoch_idx <= max_epoch:
         # train for one epoch
         valid_losses, should_stop = train(args, trainer, task, epoch_itr)
@@ -366,6 +381,9 @@ def cli_main_helper(args):
     elif args.distributed_world_size > 1:
         if not getattr(args, "tpu", False):
             # fallback for single node with multiple GPUs
+            print("setting up single node  multi gpu training")
+            print("device count", torch.cuda.device_count())
+            print(f"CUDA_VISIBLE_DEVICES: {os.getenv('CUDA_VISIBLE_DEVICES')}")
             assert args.distributed_world_size <= torch.cuda.device_count()
             port = random.randint(10000, 20000)
             args.distributed_init_method = "tcp://localhost:{port}".format(port=port)

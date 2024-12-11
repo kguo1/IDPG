@@ -22,7 +22,9 @@ try:
                 with torch.cuda.device(x.device):
                     return super().forward(x)
 
-except ImportError:
+except  Exception as e:
+    # print(f"An error occurred: {e}")
+    # print("fused layer norm is false")
     has_fused_layernorm = False
 
 

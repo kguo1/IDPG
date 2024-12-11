@@ -128,6 +128,7 @@ def load_checkpoint(args, trainer, **passthrough_args):
         checkpoint_path = os.path.join(args.save_dir, "checkpoint_last{}.pt".format(suffix))
     else:
         checkpoint_path = args.restore_file
+    print('checkpoint path', checkpoint_path)
 
     extra_state = trainer.load_checkpoint(
         checkpoint_path,
@@ -205,6 +206,20 @@ def load_model_ensemble_and_task(filenames, arg_overrides=None, task=None, stric
         args = state["args"]
         if task is None:
             task = tasks.setup_task(args)
+
+        if args.insert_position == 6:
+            model_state_dict = state['model']
+            # print(model_state_dict.keys())
+            incompatible_key = "encoder.sentence_encoder.embed_positions.weight"
+            
+            old_weights = model_state_dict[incompatible_key]
+            print('old weights size', old_weights.size())
+            print(args.max_positions, 'max positions in checkpoint utils')
+            print("args suffix length", args.suffix_len)
+            new_weights = torch.zeros(args.suffix_len + args.max_positions + 4, args.encoder_embed_dim, dtype=old_weights.dtype)
+            new_weights[:old_weights.size(0), :] = old_weights
+            model_state_dict[incompatible_key] = new_weights
+            state['model'] = model_state_dict
 
         # build model for ensemble
         model = task.build_model(args)

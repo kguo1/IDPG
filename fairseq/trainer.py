@@ -245,6 +245,20 @@ class Trainer(object):
         if bexists:
             state = checkpoint_utils.load_checkpoint_to_cpu(filename)
 
+
+            # print("printing state model")
+            # print(state['model'])
+            # print("\n\n\n")
+            if self.args.insert_position == 6:
+                
+                model_state_dict = state['model']
+                incompatible_key = "decoder.sentence_encoder.embed_positions.weight"
+                
+                old_weights = model_state_dict[incompatible_key]
+                new_weights = torch.zeros(self.args.max_positions + 2, self.args.encoder_embed_dim, dtype=old_weights.dtype)
+                new_weights[:old_weights.size(0), :] = old_weights
+                model_state_dict[incompatible_key] = new_weights
+                state['model'] = model_state_dict
             # load model parameters
             try:
                 self.get_model().load_state_dict(
@@ -422,6 +436,7 @@ class Trainer(object):
                         update_num=self.get_num_updates(),
                         ignore_grad=is_dummy_batch,
                     )
+                    print('we were able to get past the forward pass')
                     del loss
 
                 logging_outputs.append(logging_output)
@@ -430,8 +445,10 @@ class Trainer(object):
                 # emptying the CUDA cache after the first step can
                 # reduce the chance of OOM
                 if self.cuda and self.get_num_updates() == 0:
+                    print("emptying cuda cache, reduce chance of oom")
                     torch.cuda.empty_cache()
             except RuntimeError as e:
+                print('we were not able to get past forward pass')
                 if "out of memory" in str(e):
                     self._log_oom(e)
                     if raise_oom:
@@ -457,6 +474,7 @@ class Trainer(object):
                 import torch_xla.core.xla_model as xm
                 xm.mark_step()
 
+        print("got past forward pass")
         if is_dummy_batch:
             if torch.is_tensor(sample_size):
                 sample_size.zero_()
@@ -475,11 +493,13 @@ class Trainer(object):
             )
 
         overflow = False
+        torch.cuda.empty_cache()
         try:
             if self.tpu and self.data_parallel_world_size > 1:
                 import torch_xla.core.xla_model as xm
                 gradients = xm._fetch_gradients(self.optimizer.optimizer)
                 xm.all_reduce('sum', gradients, scale=1.0 / self.data_parallel_world_size)
+            
 
             with torch.autograd.profiler.record_function("multiply-grads"):
                 # multiply gradients by (# GPUs / sample_size) since DDP
@@ -491,10 +511,12 @@ class Trainer(object):
                     num = self.data_parallel_world_size if self._sync_stats() else 1
                     self.optimizer.multiply_grads(num / sample_size)
 
+            # print("got past multiplying gradients")
             with torch.autograd.profiler.record_function("clip-grads"):
                 # clip grads
                 grad_norm = self.clip_grad_norm(self.args.clip_norm)
 
+            # print("got past clipping gradients")
             # check that grad norms are consistent across workers
             if (
                 not self.args.use_bmuf
@@ -503,9 +525,11 @@ class Trainer(object):
             ):
                 self._check_grad_norms(grad_norm)
 
+            # print("about to do optimizer step")
             with torch.autograd.profiler.record_function("optimizer"):
                 # take an optimization step
                 self.optimizer.step()
+            # print("got past optimizer step")
         except FloatingPointError:
             # re-run the forward and backward pass with hooks attached to print
             # out where it fails

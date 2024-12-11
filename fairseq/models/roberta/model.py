@@ -34,6 +34,10 @@ from .hub_interface import RobertaHubInterface
 logger = logging.getLogger(__name__)
 
 
+
+def kron(A, B):
+    return torch.einsum('ij,kl->ikjl', A, B).reshape(A.shape[0]*B.shape[0], A.shape[1]*B.shape[1])
+
 @register_model('roberta')
 class RobertaModel(FairseqEncoderModel):
 
@@ -113,9 +117,9 @@ class RobertaModel(FairseqEncoderModel):
         #parser.add_argument('--prefix-pos', type=str, default='input',
         #                    help='either input or layers')
         parser.add_argument('--add-suffix', default=False, action='store_true',
-                            help='whether adding prefix tuning')
+                            help='whether adding suffix tuning')
         parser.add_argument('--suffix-len', type=int, default=0,
-                            help='the prefix token length')
+                            help='the suffix token length')
         parser.add_argument('--suffix-prompt', type=str, default=None,
                             help='the initilized suffix prompt')
         parser.add_argument('--prompt-generation', default=False, action='store_true',
@@ -157,6 +161,10 @@ class RobertaModel(FairseqEncoderModel):
 
         parser.add_argument('--insert-position', type=int, default=4, 
                             help='the insert prompt position, 1: before the first [sep], 2: after the second [sep], 3: before the third [sep], None: for single sentence task, need to add two more [sep] for the inserted prompt.')
+        
+
+        parser.add_argument('--custom_insert_position_fraction', type = float, default = 0,
+                           help = 'custom insert prompt position')
 
     @classmethod
     def build_model(cls, args, task):
@@ -165,11 +173,23 @@ class RobertaModel(FairseqEncoderModel):
         # make sure all arguments are present
         base_architecture(args)
 
+        print("inside the roberta build model function")
+
         if not hasattr(args, 'max_positions'):
             args.max_positions = args.tokens_per_sample
 
+        if args.insert_position == 6:
+            # print("adjusting and saving the positions")
+            args.original_max_positions = args.max_positions
+            args.max_positions = args.suffix_len + args.max_positions + 2
+
         encoder = RobertaEncoder(args, task.source_dictionary)
-        return cls(args, encoder)
+        # if args.insert_position == 6:
+        #     encoder.original_max_positions = original_max_positions
+        model =  cls(args, encoder)
+
+        
+        return model
 
     def forward(self, src_tokens, features_only=False, return_all_hiddens=False, classification_head_name=None, **kwargs):
         if classification_head_name is not None:
@@ -421,7 +441,10 @@ class RobertaEncoder(FairseqEncoder):
         if args.prompt_generation:
             print('generating prompt for each example...')
             if args.generation_freeze:
-                n_trans_layers_to_freeze = 24
+                if args.arch == "roberta_large":
+                    n_trans_layers_to_freeze = 24
+                else:
+                    n_trans_layers_to_freeze = 12
             else:
                 n_trans_layers_to_freeze = 0
             if args.sbert:
@@ -516,12 +539,21 @@ class RobertaEncoder(FairseqEncoder):
             self.sentence_generation = None
 
         if args.freeze_encoder:
-            n_trans_layers_to_freeze = 24
+            if args.arch == "roberta_large":
+                n_trans_layers_to_freeze = 24
+            else:
+                n_trans_layers_to_freeze = 12
         else:
 
             n_trans_layers_to_freeze = 0
 
         if not args.sbert:
+            print("custom insert position: ", args.custom_insert_position_fraction)
+            if args.insert_position == 6:
+                original_max_positions = args.original_max_positions
+            else:
+                original_max_positions = None
+
             self.sentence_encoder = TransformerSentenceEncoder(
                 dictionary=dictionary,
                 bpe=bpe if self.sentence_generation == 'glove' else None,
@@ -570,6 +602,10 @@ class RobertaEncoder(FairseqEncoder):
                 phm_bottleneck_dim=args.phm_bottleneck_dim,
                 prompt_insert_mode=args.prompt_insert_mode,
                 glove_path=args.glove,
+                custom_insert_position_fraction = args.custom_insert_position_fraction,
+                original_max_positions = original_max_positions,
+                args = args,
+
                 #prefix_MLP_mode=args.prefix_MLP_mode,
                 #prefix_pos=args.prefix_pos,
             )
@@ -630,13 +666,13 @@ class RobertaEncoder(FairseqEncoder):
             if self.args.generation_quaternions is not None:
                 tmp_x = self.generation_dense_b.repeat(x.size()[0], 1).to('cuda:0')
                 for i in range(self.args.generation_quaternions):
-                    tmp_x += torch.mm(x, torch.kron(self.generation_shared_w[i], self.generation_dense_w[i]).to('cuda:0'))
+                    tmp_x += torch.mm(x, kron(self.generation_shared_w[i], self.generation_dense_w[i]).to('cuda:0'))
                 x = self.generation_activation_fn(tmp_x)
                 x = self.generation_dropout(x)
 
                 tmp_x = self.generation_out_proj_b.repeat(x.size()[0], 1).to('cuda:0')
                 for i in range(self.args.generation_quaternions):
-                    tmp_x += torch.mm(x, torch.kron(self.generation_shared_w[i], self.generation_out_proj_w[i]).to('cuda:0'))
+                    tmp_x += torch.mm(x, kron(self.generation_shared_w[i], self.generation_out_proj_w[i]).to('cuda:0'))
                 x = tmp_x
             else:
                 x = self.generation_dense(x)
@@ -698,13 +734,13 @@ class RobertaEncoder(FairseqEncoder):
             if self.args.generation_quaternions is not None:
                 tmp_x = self.generation_dense_b.repeat(x.size()[0], 1).to('cuda:0')
                 for i in range(self.args.generation_quaternions):
-                    tmp_x += torch.mm(x, torch.kron(self.generation_shared_w[i], self.generation_dense_w[i]).to('cuda:0'))
+                    tmp_x += torch.mm(x, kron(self.generation_shared_w[i], self.generation_dense_w[i]).to('cuda:0'))
                 x = self.generation_activation_fn(tmp_x)
                 x = self.generation_dropout(x)
 
                 tmp_x = self.generation_out_proj_b.repeat(x.size()[0], 1).to('cuda:0')
                 for i in range(self.args.generation_quaternions):
-                    tmp_x += torch.mm(x, torch.kron(self.generation_shared_w[i], self.generation_out_proj_w[i]).to('cuda:0'))
+                    tmp_x += torch.mm(x, kron(self.generation_shared_w[i], self.generation_out_proj_w[i]).to('cuda:0'))
                 x = tmp_x
             else:
                 x = self.generation_dense(x)
