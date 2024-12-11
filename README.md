@@ -44,7 +44,8 @@ Model | Description | # params | Download
 125M | [roberta.base.tar.gz](https://dl.fbaipublicfiles.com/fairseq/models/roberta.base.tar.gz)
 
 
-
+### data
+The data bin folders can be downloaded from this link; https://www.dropbox.com/scl/fi/lwgwgypmotrfs9zolpunl/68611projdata.zip?rlkey=uimf2bwxy41klkgs83d5yjrvq&st=tw1aohoy&dl=0. Downlaod the zip file, place it in the IDPG directory, and unzip the file contents inside of the folder.
 
 ## Train and evaluate IDPG Fractional prompt insertion
 We provide example training scripts for fractional prompt insertion. 
